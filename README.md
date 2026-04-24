@@ -1,6 +1,6 @@
 # Philippine Labour Force Survey — Employee Stagnation Prediction
 
-Predicts employee stagnation from the PSA Labour Force Survey (LFS) 2021–2024 using a rule-based target construction and logistic regression baseline.
+Predicts employee stagnation from the PSA Labour Force Survey (LFS) 2021–2024 using a rule-based target construction and three classification models: Logistic Regression, K-Nearest Neighbors, and Linear SVM.
 
 ---
 
@@ -13,8 +13,9 @@ Employee stagnation — being stuck in a low-quality job with no path to upward 
 ## Dataset
 
 **Source:** Philippine Statistics Authority (PSA) — Labour Force Survey Public Use Files (PUF), Jan 2021 – Dec 2024  
-**Files:** 48 monthly CSVs, ~30,000–60,000 respondents per file  
-**Schemas:** Three questionnaire versions across the 4-year span (Aug–Dec 2021 used a redesigned form)
+**Files:** 48 monthly CSVs, ~30,000–60,000 respondents per file — 6,554,055 total rows before filtering  
+**Schemas:** Three questionnaire versions across the 4-year span (Aug–Dec 2021 used a redesigned form)  
+**Employed working-age subset:** 2,740,496 rows (emp_status == 1, age ≥ 15); 8.1% stagnation rate
 
 **GDP covariate:** Our World in Data — "GDP per person employed (constant 2021 PPP $)" — Philippines rows for 2021–2024
 
@@ -43,7 +44,7 @@ An **employed person (age ≥ 15)** is labelled `is_stagnant = 1` if **2 or more
 
 The 2-of-3 composite rule reduces noise from each individual indicator. See [arguments.md](arguments.md) for full justification.
 
-**Leakage prevention:** C1/C2 variables are dropped from the feature matrix. C3 variables are retained in encoded form as legitimate independent predictors.
+**Leakage prevention:** All criterion variables are dropped from the feature matrix — C1 (`want_more_work`), C2 (`nature_employment`, `worker_class`), and C3 (`education_level`, `occupation_major`). Keeping C3 variables would allow the model to reconstruct the mismatch rule directly.
 
 ---
 
@@ -53,26 +54,47 @@ The 2-of-3 composite rule reduces noise from each individual indicator. See [arg
 
 1. **Load & harmonise** — detects schema version per file, renames to a unified canonical column set, concatenates all 48 months
 2. **Filter** — employed persons only (`emp_status == 1`, age ≥ 15)
-3. **Construct target** — applies 2-of-3 stagnation rule
+3. **Construct target** — applies 2-of-3 stagnation rule; derives `education_level` and `occupation_major` for C3
 4. **Merge GDP** — year-level join on `survey_year`
-5. **Feature engineering** — education level (0–7), occupation major group (1–9), industry sector (1–10 binned), cyclical month encoding (sin/cos)
-6. **Temporal split** — train: 2021–2023, test: 2024
-7. **Imputation** — fit on train only, apply to both sets (median for continuous, mode for categorical)
-8. **Save** — `data/X_train.csv`, `data/X_test.csv`, `data/y_train.csv`, `data/y_test.csv`
+5. **Feature engineering** — industry sector (1–10 binned), cyclical month encoding (sin/cos)
+6. **Drop criterion columns** — removes all C1/C2/C3 inputs (`want_more_work`, `nature_employment`, `worker_class`, `education_level`, `occupation_major`, `education_grade`, `occupation_code`) so no downstream model can access them
+7. **Save** — `data/employed_processed.csv`
+
+Each model notebook (log_reg, knn, svm) follows the same six-step structure independently: select features → train/test split (2021–2023 / 2024) → impute from training set → scale → train model → evaluate with classification report, confusion matrix, and AUC-PR curve.
+
+**Train set:** 2,060,789 rows (8.45% stagnation rate)  
+**Test set:** 679,707 rows (6.95% stagnation rate)
 
 ### `notebooks/log_reg.ipynb`
 
-1. **Train** — `LogisticRegression(class_weight='balanced', solver='saga', C=1.0)` via `StandardScaler` pipeline
-2. **Sigmoid visualisation** — sigmoid function, score distribution, calibration plot
-3. **Classification report** — precision, recall, F1 at default threshold (0.5)
-4. **PR curve + AUC-PR** — primary metric for imbalanced classification
-5. **ROC curve + AUC-ROC** — secondary metric
-6. **Optimal threshold** — threshold that maximises F1 for the stagnant class
-7. **Feature importance** — standardised logistic coefficients (log-odds scale)
+1. **Pearson correlation** — linear association between each feature and `is_stagnant`
+2. **Impute + scale** — mode for categorical, median for continuous; `StandardScaler` fit on train only
+3. **Train** — `LogisticRegression(C=1.0, class_weight='balanced', solver='saga', max_iter=500)`
+4. **Classification report** — precision, recall, F1 at default threshold (0.5)
+5. **PR curve + AUC-PR** — primary metric; uses `predict_proba`
+6. **Coefficients** — standardised log-odds coefficients sorted by magnitude
+
+### `notebooks/knn.ipynb`
+
+1. **Pearson correlation** — linear association between each feature and `is_stagnant`
+2. **Impute + scale** — same strategy as log_reg; scaling critical for distance-based algorithm
+3. **Balanced subsample** — 25,000 stagnant + 25,000 not-stagnant drawn from training set (`rng(42)`)
+4. **Train** — `KNeighborsClassifier(n_neighbors=15, metric='euclidean', n_jobs=-1)`
+5. **Classification report + confusion matrix**
+6. **PR curve + AUC-PR** — uses `predict_proba`
+
+### `notebooks/svm.ipynb`
+
+1. **Pearson correlation** — linear association between each feature and `is_stagnant`
+2. **Impute + scale** — same strategy as log_reg
+3. **Train** — `LinearSVC(C=0.1, class_weight='balanced', max_iter=2000)`
+4. **Classification report + confusion matrix**
+5. **PR curve + AUC-PR** — uses `decision_function` (signed distance from hyperplane) as ranking score since `LinearSVC` does not produce probabilities
+6. **Coefficients** — margin coefficients sorted by magnitude
 
 ---
 
-## Feature Matrix (14 features)
+## Feature Matrix (12 features)
 
 | Feature | Type | Description |
 |---------|------|-------------|
@@ -82,8 +104,6 @@ The 2-of-3 composite rule reduces noise from each individual indicator. See [arg
 | `region` | Categorical | PSA region code (1–17) |
 | `urban_rural` | Binary | 1=urban, 2=rural |
 | `hh_size` | Continuous | Household size |
-| `education_level` | Ordinal | 0=no grade … 7=post-graduate |
-| `occupation_major` | Categorical | PSOC 1-digit major group (1–9) |
 | `industry_sector` | Categorical | Binned PSIC sector (1–10) |
 | `normal_hours` | Continuous | Normal hours per week contracted |
 | `actual_hours` | Continuous | Actual hours worked last week |
@@ -98,11 +118,13 @@ The 2-of-3 composite rule reduces noise from each individual indicator. See [arg
 | Decision | Choice | Why |
 |----------|--------|-----|
 | Target construction | 2-of-3 composite | Reduces false positives from noisy individual indicators |
-| Train/test split | Temporal (2021-2023 / 2024) | Prevents temporal leakage; reflects real deployment scenario |
-| Class imbalance | `class_weight='balanced'` | Computationally equivalent to oversampling at 1M+ scale; SMOTE is prohibitive |
+| Train/test split | Temporal (2021–2023 / 2024) | Prevents temporal leakage; reflects real deployment scenario |
+| Class imbalance | `class_weight='balanced'` (LR, SVM); balanced subsample (KNN) | LR/SVM: loss-function weighting at 2M+ scale; KNN has no loss function — balanced subsample removes imbalance from majority vote |
 | Primary metric | AUC-PR | ROC-AUC is misleading under class imbalance (inflated by true negatives) |
-| Model | Logistic regression | Interpretable coefficients; calibrated probabilities; scales to 1M+ rows |
-| Imputation | Median/mode from train only | Prevents test leakage; preserves missing-as-unknown semantics |
+| Logistic regression | `LogisticRegression(solver='saga', C=1.0)` | Interpretable log-odds coefficients; calibrated probabilities; SAGA solver scales to 2M+ rows |
+| KNN | `KNeighborsClassifier(n_neighbors=15, metric='euclidean')` on 50k subsample | Non-parametric; lazy learner requires subsample for tractable prediction on 679k test rows |
+| Linear SVM | `LinearSVC(C=0.1)` + `decision_function` for AUC-PR | Maximum-margin boundary; primal solver avoids quadratic memory cost of kernel SVM; no native probabilities — decision scores used for ranking |
+| Imputation | Mode (categorical) / median (continuous) from train only | Prevents test leakage; mode for `urban_rural` because 2024 survey dropped that column entirely |
 | Month encoding | sin/cos cyclical | Respects circular nature of calendar months |
 
 Full technical justifications in [arguments.md](arguments.md).
@@ -111,26 +133,19 @@ Full technical justifications in [arguments.md](arguments.md).
 
 ## Outputs
 
-After running both notebooks in order:
+After running all notebooks in order:
 
 ```
 data/
-├── X_train.csv                      # Feature matrix, 2021-2023
-├── X_test.csv                       # Feature matrix, 2024
-├── y_train.csv                      # Stagnation labels, 2021-2023
-├── y_test.csv                       # Stagnation labels, 2024
-├── employed_processed.csv           # Full processed employed dataset
-├── imputation_fill_values.pkl       # Imputation constants (reproducibility)
+├── employed_processed.csv    # 2,740,496 employed working-age rows with engineered features
+│                             # Each model notebook performs its own train/test split and imputation
 ├── stagnation_class_distribution.png
 ├── feature_distributions.png
-├── sigmoid_diagnostics.png
-├── confusion_matrix.png
-├── pr_roc_curves.png
-├── threshold_f1.png
-└── feature_importance.png
-models/
-└── logistic_regression.pkl
+├── confusion_matrix.png      # Generated per model notebook
+└── pr_roc_curves.png         # Generated per model notebook
 ```
+
+Each model notebook holds its train/test split, imputation fill values, scaler, and model in memory rather than persisting them to disk — rerun the notebook to reproduce results.
 
 ---
 
@@ -142,14 +157,18 @@ source venv/Scripts/activate  # Windows
 # or: source venv/bin/activate  # Unix/Mac
 
 # 2. Install dependencies (if not already installed)
-pip install pandas numpy scikit-learn matplotlib seaborn joblib
+pip install pandas numpy scikit-learn matplotlib seaborn
 
-# 3. Run pipeline first, then model
+# 3. Run pipeline first — produces employed_processed.csv
 jupyter nbconvert --to notebook --execute notebooks/data-pipeline.ipynb
+
+# 4. Run model notebooks in any order (each is self-contained)
 jupyter nbconvert --to notebook --execute notebooks/log_reg.ipynb
+jupyter nbconvert --to notebook --execute notebooks/knn.ipynb
+jupyter nbconvert --to notebook --execute notebooks/svm.ipynb
 ```
 
-Or open in Jupyter Lab and run cells sequentially.
+Or open in Jupyter Lab and run cells sequentially. The data pipeline must run before any model notebook.
 
 ---
 
@@ -163,4 +182,8 @@ Or open in Jupyter Lab and run cells sequentially.
 
 4. **No wage data:** The LFS records basic pay (`PUFC25_PBASIC`) but with high missingness and inconsistent reporting. Wage-based stagnation measures (earning below living wage) were excluded due to data quality.
 
-5. **Logistic regression baseline only:** Linear decision boundaries cannot capture interaction effects (e.g., education × region × industry traps). Tree-based models (XGBoost, LightGBM) are natural next steps.
+5. **Linear decision boundaries (LR and SVM):** Cannot capture interaction effects (e.g., age × industry traps). KNN can approximate these locally but is constrained to the 50k subsample. Tree-based models (XGBoost, LightGBM) are natural next steps.
+
+6. **KNN subsample approximation:** The 50,000-record balanced subsample is a computational necessity, not a design choice. A larger subsample would improve representativeness at the cost of prediction time.
+
+7. **No probability calibration for SVM:** `LinearSVC.decision_function` scores are used for ranking (AUC-PR) but are not calibrated probabilities — they cannot be directly interpreted as "probability of stagnation." Platt scaling or isotonic regression would be needed for probability-based deployment.
